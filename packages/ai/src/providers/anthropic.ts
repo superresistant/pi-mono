@@ -153,7 +153,15 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]):
 	return blocks;
 }
 
-export type AnthropicEffort = "low" | "medium" | "high" | "max";
+export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * Check if a model is Opus 4.7 or later.
+ * Opus 4.7+ rejects sampling parameters, requires display opt-in for thinking, etc.
+ */
+function isOpus47OrLater(modelId: string): boolean {
+	return modelId.includes("opus-4-7") || modelId.includes("opus-4.7");
+}
 
 export interface AnthropicOptions extends StreamOptions {
 	/**
@@ -448,11 +456,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 };
 
 /**
- * Check if a model supports adaptive thinking (Opus 4.6 and Sonnet 4.6)
+ * Check if a model supports adaptive thinking (Opus 4.7, Opus 4.6, and Sonnet 4.6)
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
-	// Opus 4.6 and Sonnet 4.6 model IDs (with or without date suffix)
 	return (
+		modelId.includes("opus-4-7") ||
+		modelId.includes("opus-4.7") ||
 		modelId.includes("opus-4-6") ||
 		modelId.includes("opus-4.6") ||
 		modelId.includes("sonnet-4-6") ||
@@ -462,9 +471,12 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 
 /**
  * Map ThinkingLevel to Anthropic effort levels for adaptive thinking.
- * Note: effort "max" is only valid on Opus 4.6.
+ * Opus 4.7 supports the new "xhigh" effort level natively.
+ * "max" is valid on Opus 4.6 and Opus 4.7.
  */
 function mapThinkingLevelToEffort(level: SimpleStreamOptions["reasoning"], modelId: string): AnthropicEffort {
+	const isOpus47 = modelId.includes("opus-4-7") || modelId.includes("opus-4.7");
+	const isOpus46 = modelId.includes("opus-4-6") || modelId.includes("opus-4.6");
 	switch (level) {
 		case "minimal":
 			return "low";
@@ -475,7 +487,9 @@ function mapThinkingLevelToEffort(level: SimpleStreamOptions["reasoning"], model
 		case "high":
 			return "high";
 		case "xhigh":
-			return modelId.includes("opus-4-6") || modelId.includes("opus-4.6") ? "max" : "high";
+			if (isOpus47) return "xhigh";
+			if (isOpus46) return "max";
+			return "high";
 		default:
 			return "high";
 	}
@@ -564,7 +578,11 @@ function createClient(
 		return { client, isOAuthToken: false };
 	}
 
-	const betaFeatures = ["fine-grained-tool-streaming-2025-05-14"];
+	// fine-grained-tool-streaming is GA on Opus 4.6+/Sonnet 4.6+; skip for adaptive-thinking models.
+	const betaFeatures: string[] = [];
+	if (!supportsAdaptiveThinking(model.id)) {
+		betaFeatures.push("fine-grained-tool-streaming-2025-05-14");
+	}
 	if (needsInterleavedBeta) {
 		betaFeatures.push("interleaved-thinking-2025-05-14");
 	}
@@ -580,7 +598,7 @@ function createClient(
 				{
 					accept: "application/json",
 					"anthropic-dangerous-direct-browser-access": "true",
-					"anthropic-beta": `claude-code-20250219,oauth-2025-04-20,${betaFeatures.join(",")}`,
+					"anthropic-beta": ["claude-code-20250219", "oauth-2025-04-20", ...betaFeatures].join(","),
 					"user-agent": `claude-cli/${claudeCodeVersion}`,
 					"x-app": "cli",
 				},
@@ -601,7 +619,7 @@ function createClient(
 			{
 				accept: "application/json",
 				"anthropic-dangerous-direct-browser-access": "true",
-				"anthropic-beta": betaFeatures.join(","),
+				...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
 			},
 			model.headers,
 			optionsHeaders,
@@ -653,7 +671,8 @@ function buildParams(
 	}
 
 	// Temperature is incompatible with extended thinking (adaptive or budget-based).
-	if (options?.temperature !== undefined && !options?.thinkingEnabled) {
+	// Opus 4.7+ rejects temperature/top_p/top_k at any non-default value (400 error).
+	if (options?.temperature !== undefined && !options?.thinkingEnabled && !isOpus47OrLater(model.id)) {
 		params.temperature = options.temperature;
 	}
 
@@ -661,15 +680,24 @@ function buildParams(
 		params.tools = convertTools(context.tools, isOAuthToken, cacheControl);
 	}
 
-	// Configure thinking mode: adaptive (Opus 4.6 and Sonnet 4.6),
+	// Configure thinking mode: adaptive (Opus 4.7, Opus 4.6, and Sonnet 4.6),
 	// budget-based (older models), or explicitly disabled.
 	if (model.reasoning) {
 		if (options?.thinkingEnabled) {
 			if (supportsAdaptiveThinking(model.id)) {
-				// Adaptive thinking: Claude decides when and how much to think
-				params.thinking = { type: "adaptive" };
+				// Adaptive thinking: Claude decides when and how much to think.
+				// Opus 4.7 defaults thinking display to "omitted" (empty thinking blocks),
+				// so opt in to "summarized" to surface reasoning in the TUI.
+				// Cast needed: SDK v0.73 types don't include `display` or `xhigh` yet.
+				if (isOpus47OrLater(model.id)) {
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					(params as any).thinking = { type: "adaptive", display: "summarized" };
+				} else {
+					params.thinking = { type: "adaptive" };
+				}
 				if (options.effort) {
-					params.output_config = { effort: options.effort };
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					(params as any).output_config = { effort: options.effort };
 				}
 			} else {
 				// Budget-based thinking for older models
